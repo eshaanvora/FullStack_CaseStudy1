@@ -1,0 +1,194 @@
+---
+title: "Case Study 1"
+author: "Eshaan Vora"
+subtitle: "Full Stack Analyst"
+output: 
+  html_document:
+  df_print: paged
+html_notebook: default
+---
+
+###### Style Reference: https://www.rstudio.com/wp-content/uploads/2015/02/rmarkdown-cheatsheet.pdf
+
+# Predicting Interest Rate from Individual's Loan Data
+### (Note: Loan Data represents loans already issued)
+
+```{r setup, include=FALSE}
+library('dplyr')
+library("tidyverse")
+library('glmnet')
+library('glmnetUtils')
+library('randomForest')
+library('ggplot2')
+library('caret')
+library('pkgcond')
+library('usmap')
+library('viridis')
+```
+
+## Clean Data
+```{r}
+#Update file path
+filePath = "loans_full_schema.csv"
+data = read.csv(filePath, stringsAsFactors = TRUE)
+
+#Define function to print variables with missing values
+num_missing_val <- function(data_frame){
+  print("Count of Variables' Missing Values:")
+  for(i in colnames(data_frame)){
+    num_missing <- sum(is.na(data_frame %>% select(i)))
+    if(num_missing > 0){
+      print(paste0(i, " NA Count: ", num_missing))}}
+    }
+suppress_messages(num_missing_val(data))
+
+#Most of the missing values are because the filer is single and cannot produce joint filer data 
+#Filter data based on whether the filer is a single filer
+data_clean <- subset(data, is.na(annual_income_joint))
+
+#Remove variables with low explanatory power based on variable importance analysis
+data_clean <- select(data_clean,-c(emp_title, emp_length, application_type, annual_income_joint, debt_to_income_joint, verification_income_joint, current_accounts_delinq, num_accounts_120d_past_due, num_accounts_30d_past_due))
+
+#Impute "N/A" values to the largest value in the "months_since_delinquency" variable
+#This is assuming filers with an "N/A" for the variable "months_since_delinquency" have never been delinquent and so they should be imputed with the largest value
+data_clean$months_since_last_delinq <- data_clean$months_since_last_delinq %>% replace_na(max(data_clean$months_since_last_delinq, na.rm=T))
+#Impute "N/A" values to the largest value in the "months_since_90d_late" variable
+data_clean$months_since_90d_late <- data_clean$months_since_90d_late %>% replace_na(max(data_clean$months_since_90d_late, na.rm=T))
+#Impute "N/A" values to the largest value in the "months_since_last_credit_inquiry" variable
+data_clean$months_since_last_credit_inquiry <- data_clean$months_since_last_credit_inquiry %>% replace_na(max(data_clean$months_since_last_credit_inquiry, na.rm=T))
+```
+
+## Split Data into Training and Test Data
+```{r}
+#Split 80% of data for model training and 20% for model testing
+set.seed(1999)
+split_data = sort(sample(nrow(data_clean), nrow(data_clean)*.8))
+train<-data_clean[split_data,]
+test<-data_clean[-split_data,]
+```
+
+## Model Prediction
+#### Random Forest Model
+```{r}
+#RANDOM FOREST MODEL
+#IMPORTANT NOTE: The loan grading variables "grade" and "sub_grade"  and the interest rate given for the loan, are determined on many of the same indicators of credit risk and the loan's sub-grading often determines the additional interest rate adjustment for risk & volatility above the base interest rate, giving the variables an outsized explanatory power in interest rate prediction
+
+random_forest_model <- randomForest(interest_rate ~ . 
+                                    #- grade -sub_grade 
+                                    -paid_interest -paid_principal -balance -term -total_debit_limit, data = data_clean, mtry = 5, importance = TRUE, ntree=150)
+
+print(random_forest_model)
+#Error begins to plateau when we use 150 decision trees
+#mtry value was tuned starting from n/3 where n is the number of variables (mtry represents number of variables sampled per split)
+plot(random_forest_model)
+
+results_random_forest <- data.frame(predict(random_forest_model, test), test$interest_rate) %>% rename(Random_Forest_Predicted_Interest_Rate = 1, Actual_Interest_Rate = 2)
+
+cat("Sample random forest model predictions:\nPredicted Interest Rate vs Actual Interest Rate:")
+head(results_random_forest,n=10)
+
+#Variable importance for random forest model
+i_scores <- varImp(random_forest_model, conditional=TRUE) %>% arrange(-Overall)
+print("Variable Importance in Predicting Interest Rates: ")
+head(i_scores,n=15)
+```
+
+#### Lasso Regression Model
+```{r}
+#LASSO REGRESSION MODEL
+#The explanatory variables exhibit multicollinearity due to the high correlation of credit risk and credit worthiness data
+#Due to multicollinearity, the model's coefficient estimates will be confounded, and so we will add a high shrinkage penalty 
+lasso_model <- cv.glmnet(interest_rate ~ . 
+                         #-grade -sub_grade
+                         , data = train, alpha = 1)
+
+print(lasso_model)
+#The MSE plateaus at 58 variables, indicating the lasso model has reduced the coefficient to 0 for 46 variables
+#Next we will determine which variables to discard from future modeling
+plot(lasso_model)
+
+results_lasso <- data.frame(predict(lasso_model, test), test$interest_rate) %>% rename(Lasso_Model_Predicted_Interest_Rate = 1, Actual_Interest_Rate = 2)
+
+print("Sample model predictions:")
+head(results_lasso,n = 10)
+
+#Determine variable importance, including the factor levels within string variables
+#Determine which variables affect prediction the most at lambda.1se (or 1 standard error away from lambda value with minimum MSE)
+#Reference:https://localcoder.org/glmnet-variable-importance
+coefList <- coef(lasso_model, s='lambda.1se')
+coefList <- data.frame(coefList@Dimnames[[1]][coefList@i+1],coefList@x) %>% arrange(-coefList.x)
+names(coefList) <- c('Variable','Coefficient')
+print("Variable Importance in Predicting Interest Rates:")
+head(coefList,n=10)
+```
+
+## Data Visualizations
+
+#### Mean Interest Rate vs. Investment Quality
+##### Note: There are no subgrades "G2","G3","G5" in the dataset
+```{r}
+#The lower-grade the investment, the riskier and therefore the higher the interest rates
+group_by_grade <- data_clean %>% group_by(grade, sub_grade) %>% summarise(meanInterestRate = mean(interest_rate),.groups='rowwise') %>% rename(Investment_Grade = grade)
+
+ggplot(group_by_grade, aes(y = meanInterestRate, x=Investment_Grade, fill=sub_grade, col=I("black"))) + 
+  geom_bar(position="dodge", stat="identity") + xlab("Sub-Grade of Investment")
+```
+
+#### Interest Rate by State (Are certain state potentially more expensive to borrow in?)
+##### Note: There is no data available for the state of Iowa (IA)
+```{r}
+group_by_state <- data_clean %>% group_by(state) %>% summarise(meanInterestRate = mean(interest_rate), .groups='rowwise') %>% arrange(desc(meanInterestRate))
+
+#Top 5 States with highest Interest Rate
+head(group_by_state,n=5)
+#Bottom 5 States with lowest Interest Rate
+tail(group_by_state,n=5)
+
+#Wyoming, Hawaii, and North Dakota have the highest average interest rates in the country, while Maine has the lowest average interest rate
+plot_usmap(data = group_by_state, values = "meanInterestRate", labels=TRUE) + 
+  scale_fill_continuous(low = "white", high = "red", name = "Mean Interest Rate", label = scales::comma
+  ) + theme(legend.position = "right")
+```
+
+#### Loan Purpose vs. Mean Interest Rate
+##### We will observe whether certain debt purchases are riskier to lend than others? (Therefore commanding a higher interest rate)
+```{r}
+group_by_loan <- data_clean %>% group_by(loan_purpose) %>% summarise(meanInterestRate = mean(interest_rate), meanCreditUse = mean(total_credit_utilized),.groups="rowwise") %>% arrange(desc(meanInterestRate))
+
+ggplot(group_by_loan, aes(x = reorder(loan_purpose, +meanInterestRate), y = meanInterestRate, fill=meanInterestRate)) + scale_fill_viridis_c(option='magma') + ylim(0,14) + geom_bar(position="dodge", stat="identity") + xlab("Purpose of Loan")
+
+#Loan Purposes with 3 highest average Interest Rates
+head(group_by_loan,n=3)
+#Loan Purposes with the 3 lowest average Interest Rates
+tail(group_by_loan,n=3)
+```
+#### Loan Purpose vs. Credit Utilization
+```{r}
+#Credit Usage represents loan balance based on revolving credit and excluding mortgages
+#Customers who sought funding for Renewable Energy had the highest level of credit debt among customers seeking all type of loans
+ggplot(group_by_loan, aes(x = reorder(loan_purpose, -meanCreditUse), y = meanCreditUse, fill=meanCreditUse)) + scale_fill_viridis_c() + geom_bar(position="dodge", stat="identity") + ggtitle("Purpose of Loan VS. Credit Utilization") + xlab("Purpose of Loan") + ylab("Credit Usage ($)")
+```
+
+#### Number of Active Debit Accounts VS. Debt-to-Income
+##### Individuals with a greater number of active debit accounts tended to have a lower debt to income ratio
+```{r}
+#Debit Accounts and Debt to Income
+ggplot(data_clean, aes(x = num_active_debit_accounts, y=debt_to_income)) + geom_bin2d() + ggtitle("Number of Active Debit Accounts VS. Debt-to-Income") +
+  xlab("Active Debit Accounts") + ylab("Debt-to-Income Ratio")
+```
+
+#### Homeownership vs. Mean Interest Rate
+##### Renters had interest rates, most often, between 10-15%, unlike mortgagers and owners who had more loans fall between 5%-10%
+```{r}
+#Break the continuous variable "interest_rate" into 
+data_clean$interest_rate_category <- cut(data_clean$interest_rate,
+              breaks=c(5, 10, 15, 20, 25, 31),
+              labels=c('5% - 10%', '10% - 15%', '15% - 20%', '20% - 25%' , '25% - 31%'))
+
+group_by_interest_rate_category <- data_clean %>% group_by(interest_rate_category) %>% count(homeownership)
+
+ggplot(group_by_interest_rate_category, aes(x = interest_rate_category, y = n, fill=homeownership)) + geom_bar(position="dodge", stat="identity") + ggtitle("Homeownership VS. Interest Rate Category") + ylab("Number of Loans") + xlab("Interest Rate Category")
+
+group_by_ownership <- data_clean %>% group_by(homeownership) %>% summarise(meanInterestRate = mean(interest_rate), .groups="rowwise") %>% arrange(desc(meanInterestRate))
+```
+
